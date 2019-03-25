@@ -114,6 +114,15 @@ func TestAccSqlSourceRepresentationInstance_full(t *testing.T) {
 				ImportState:       true,
 				ImportStateVerify: true,
 			},
+			{
+				Config: fmt.Sprintf(
+					testGoogleSqlSourceRepresentationInstance_full_recreated, databaseName),
+			},
+			{
+				ResourceName:      "google_sql_source_representation_instance.master",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
 		},
 	})
 }
@@ -149,5 +158,15 @@ resource "google_sql_source_representation_instance" "master" {
   region               = "us-east1"
   host                 = "10.20.30.40"
   port                 = 33006
+}
+`
+
+var testGoogleSqlSourceRepresentationInstance_full_recreated = `
+resource "google_sql_source_representation_instance" "master" {
+  name                 = "tf-test-source-representation-instance-%s"
+  database_version     = "MYSQL_5_7"
+  region               = "us-central1"
+  host                 = "40.30.20.10"
+  port                 = 33066
 }
 `
