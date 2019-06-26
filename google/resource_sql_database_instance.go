@@ -18,6 +18,15 @@ import (
 
 const privateNetworkLinkRegex = "projects/(" + ProjectRegex + ")/global/networks/((?:[a-z](?:[-a-z0-9]*[a-z0-9])?))$"
 
+var modifiableReplicationKeys = []string{
+	"master_instance_name",
+	"replica_configuration.0.ca_certificate",
+	"replica_configuration.0.client_certificate",
+	"replica_configuration.0.client_key",
+	"replica_configuration.0.password",
+	"replica_configuration.0.username",
+}
+
 var sqlDatabaseAuthorizedNetWorkSchemaElem *schema.Resource = &schema.Resource{
 	Schema: map[string]*schema.Schema{
 		"expiration_time": {
@@ -52,7 +61,9 @@ func resourceSqlDatabaseInstance() *schema.Resource {
 		},
 
 		CustomizeDiff: customdiff.All(
-			customdiff.ForceNewIfChange("settings.0.disk_size", isDiskShrinkage)),
+			customdiff.ForceNewIfChange("settings.0.disk_size", isDiskShrinkage),
+			// customdiff.ForceNewIf("replica_configuration", isUnmodifiableReplicationChange),
+		),
 
 		Schema: map[string]*schema.Schema{
 			"region": {
@@ -333,17 +344,14 @@ func resourceSqlDatabaseInstance() *schema.Resource {
 						"ca_certificate": {
 							Type:     schema.TypeString,
 							Optional: true,
-							ForceNew: true,
 						},
 						"client_certificate": {
 							Type:     schema.TypeString,
 							Optional: true,
-							ForceNew: true,
 						},
 						"client_key": {
 							Type:     schema.TypeString,
 							Optional: true,
-							ForceNew: true,
 						},
 						"connect_retry_interval": {
 							Type:     schema.TypeInt,
@@ -368,7 +376,6 @@ func resourceSqlDatabaseInstance() *schema.Resource {
 						"password": {
 							Type:      schema.TypeString,
 							Optional:  true,
-							ForceNew:  true,
 							Sensitive: true,
 						},
 						"ssl_cipher": {
@@ -379,7 +386,6 @@ func resourceSqlDatabaseInstance() *schema.Resource {
 						"username": {
 							Type:     schema.TypeString,
 							Optional: true,
-							ForceNew: true,
 						},
 						"verify_server_certificate": {
 							Type:     schema.TypeBool,
@@ -450,6 +456,20 @@ func isFirstGen(d *schema.ResourceData) bool {
 	// 1st Generation databases have tiers like 'D0', as opposed to 2nd Generation which are
 	// prefixed with 'db'
 	return !regexp.MustCompile("db*").Match([]byte(tier))
+}
+
+// Detects whether a modifiable replication change
+func hasModifiableReplicationChange(d *schema.ResourceData) bool {
+	if d.HasChange("replica_configuration.0.failover_target") {
+		return false
+	}
+
+	for _, key := range modifiableReplicationKeys {
+		if d.HasChange(key) {
+			return true
+		}
+	}
+	return false
 }
 
 func resourceSqlDatabaseInstanceCreate(d *schema.ResourceData, meta interface{}) error {
@@ -754,6 +774,126 @@ func resourceSqlDatabaseInstanceRead(d *schema.ResourceData, meta interface{}) e
 	return nil
 }
 
+func resourceSqlDatabaseInstancePossiblyStopReplication(d *schema.ResourceData, meta interface{}) error {
+	// Nothing to do unless the instance is a replica.
+	old, _ := d.GetChange("master_instance_name")
+	oldMaster := old.(string)
+	if oldMaster == "" {
+		return nil
+	}
+
+	// Nothing to do unless there's a modifiable replication change.
+	if !hasModifiableReplicationChange(d) {
+		return nil
+	}
+
+	// Replication configuration changed, so call PromoteReplica to remove old
+	// settings.
+	config := meta.(*Config)
+
+	project, err := getProject(d, config)
+	if err != nil {
+		return err
+	}
+
+	instanceName := d.Get("name").(string)
+
+	// Get a lock on the master instance just in case updating any replica
+	// settings causes operations on the master.
+	mutexKV.Lock(instanceMutexKey(project, oldMaster))
+	defer mutexKV.Unlock(instanceMutexKey(project, oldMaster))
+
+	op, err := config.clientSqlAdmin.Instances.PromoteReplica(project, instanceName).Do()
+	if err != nil {
+		return fmt.Errorf("Error, failed to promote SQL replica instance %s: %s", instanceName, err)
+	}
+
+	err = sqladminOperationWaitTime(config, op, project, "Promote Replica", int(d.Timeout(schema.TimeoutUpdate).Minutes()))
+	if err != nil {
+		return err
+	}
+
+	// Update state.
+	d.Set("master_instance_name", nil)
+	if err := d.Set("replica_configuration", nil); err != nil {
+		log.Printf("[WARN] Failed to reset SQL Database Instance Replica Configuration")
+	}
+
+	return nil
+}
+
+func resourceSqlDatabaseInstancePossiblyStartReplication(d *schema.ResourceData, meta interface{}) error {
+	// Nothing to do unless the instance needs to become a replica.
+	_, new := d.GetChange("master_instance_name")
+	newMaster := new.(string)
+	if newMaster == "" {
+		return nil
+	}
+
+	// Nothing to do unless there's a modifiable replication change.
+	if !hasModifiableReplicationChange(d) {
+		return nil
+	}
+
+	// Nothing to do if new configuration does not include a replica_configuration field.
+	replicaConfiguration := d.Get("replica_configuration").([]interface{})
+	if len(replicaConfiguration) == 0 || replicaConfiguration[0] == nil {
+		return nil
+	}
+
+	// Replication configuration changed, so call DemoteMaster to apply new
+	// settings.
+	config := meta.(*Config)
+
+	project, err := getProject(d, config)
+	if err != nil {
+		return err
+	}
+
+	instanceName := d.Get("name").(string)
+
+	// Get a lock on the master instance just in case updating any replica
+	// settings causes operations on the master.
+	mutexKV.Lock(instanceMutexKey(project, newMaster))
+	defer mutexKV.Unlock(instanceMutexKey(project, newMaster))
+
+	mysqlReplicaConfiguration := replicaConfiguration[0].(map[string]interface{})
+	request := &sqladmin.InstancesDemoteMasterRequest{
+		DemoteMasterContext: &sqladmin.DemoteMasterContext{
+			MasterInstanceName: newMaster,
+			ReplicaConfiguration: &sqladmin.DemoteMasterConfiguration{
+				MysqlReplicaConfiguration: &sqladmin.DemoteMasterMySqlReplicaConfiguration{
+					CaCertificate:     mysqlReplicaConfiguration["ca_certificate"].(string),
+					ClientCertificate: mysqlReplicaConfiguration["client_certificate"].(string),
+					ClientKey:         mysqlReplicaConfiguration["client_key"].(string),
+					Password:          mysqlReplicaConfiguration["password"].(string),
+					Username:          mysqlReplicaConfiguration["username"].(string),
+				},
+			},
+		},
+	}
+
+	op, err := config.clientSqlAdmin.Instances.DemoteMaster(project, instanceName, request).Do()
+	if err != nil {
+		return fmt.Errorf("Error, failed to demote SQL instance %s to replicate %s: %s", instanceName, newMaster, err)
+	}
+
+	err = sqladminOperationWaitTime(config, op, project, "Demote Master", int(d.Timeout(schema.TimeoutUpdate).Minutes()))
+	if err != nil {
+		return err
+	}
+
+	// Update state.
+	d.Set("master_instance_name", strings.TrimPrefix(newMaster, project+":"))
+	d.Set("replica_configuration.0.ca_certificate", mysqlReplicaConfiguration["ca_certificate"])
+	d.Set("replica_configuration.0.client_certificate", mysqlReplicaConfiguration["client_certificate"])
+	d.Set("replica_configuration.0.client_key", mysqlReplicaConfiguration["client_key"])
+	d.Set("replica_configuration.0.password", mysqlReplicaConfiguration["password"])
+	d.Set("replica_configuration.0.username", mysqlReplicaConfiguration["username"])
+
+	return nil
+}
+
 func resourceSqlDatabaseInstanceUpdate(d *schema.ResourceData, meta interface{}) error {
 	config := meta.(*Config)
 
@@ -762,7 +902,11 @@ func resourceSqlDatabaseInstanceUpdate(d *schema.ResourceData, meta interface{})
 		return err
 	}
 
-	// Update only updates the settings, so they are all we need to set.
+	if err := resourceSqlDatabaseInstancePossiblyStopReplication(d, meta); err != nil {
+		return err
+	}
+
+	// The update API only updates the settings, so they are all we need to set.
 	instance := &sqladmin.DatabaseInstance{
 		Settings: expandSqlDatabaseInstanceSettings(d.Get("settings").([]interface{}), !isFirstGen(d)),
 	}
@@ -781,6 +925,15 @@ func resourceSqlDatabaseInstanceUpdate(d *schema.ResourceData, meta interface{})
 
 	err = sqladminOperationWaitTime(config, op, project, "Update Instance", int(d.Timeout(schema.TimeoutUpdate).Minutes()))
 	if err != nil {
+		return err
+	}
+
+	// The update API only updates the settings, so they are all we need to update in our state.
+	if err := d.Set("settings", flattenSettings(instance.Settings)); err != nil {
+		log.Printf("[WARN] Failed to set SQL Database Instance Settings")
+	}
+
+	if err := resourceSqlDatabaseInstancePossiblyStartReplication(d, meta); err != nil {
 		return err
 	}
 
